@@ -646,11 +646,21 @@ async function fazerLogout(){
   document.getElementById('success')?.classList.add('hidden');
 }
 
+function comTimeout(promise, ms, mensagem){
+  return Promise.race([
+    promise,
+    new Promise((_, reject)=>setTimeout(()=>reject(new Error(mensagem)), ms))
+  ]);
+}
+
 async function uploadArquivo(protocolo, file, categoria){
   const safeName=file.name.replace(/[^a-zA-Z0-9._-]/g,'_');
   const path=`solicitacoes/${protocolo}/${categoria}/${Date.now()}_${safeName}`;
+  const headers={apikey:SUPABASE_KEY,'Content-Type':file.type||'application/octet-stream','x-upsert':'false'};
+  const accessToken=getAccessToken();
+  if(accessToken) headers.Authorization='Bearer '+accessToken;
   const r=await fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${path}`,{
-    method:'POST',headers:{apikey:SUPABASE_KEY,Authorization:'Bearer '+(getAccessToken()||SUPABASE_KEY),'Content-Type':file.type||'application/octet-stream','x-upsert':'false'},body:file
+    method:'POST',headers,body:file
   });
   const t=await r.text(); let d=null; try{d=t?JSON.parse(t):null}catch(e){d={}};
   if(!r.ok) throw new Error(d?.message||d?.error||`Falha ao enviar o arquivo ${file.name}`);
@@ -669,10 +679,13 @@ async function registrarDocumento(solicitacaoId, doc){
 // EmailJS permite envio direto do navegador e suporta anexos via sendForm.
 // https://www.emailjs.com/docs/user-guide/file-attachments/
 const EMAIL_CONFIG = {
-  publicKey: "",
-  serviceId: "",
-  templateId: "",
-  destinationEmail: "contabilidade@transframento.com.br"
+  // Preencha somente estes 3 identificadores da sua conta EmailJS.
+  // A chave pública pode ficar no navegador; não coloque chave privada aqui.
+  publicKey: "gjthDc-QHOUCcRGnV",
+  serviceId: "service_tcyml7d",
+  templateNewRequestId: "template_no0sp9o",
+  templateStatusId: "template_b3gdaat",
+  destinationEmail: "juliana@transframento.com.br"
 };
 
 function initEmailJS(){
@@ -681,6 +694,95 @@ function initEmailJS(){
   }
 }
 initEmailJS();
+
+function emailConfigurado(){
+  return !!(window.emailjs && EMAIL_CONFIG.publicKey && EMAIL_CONFIG.serviceId);
+}
+
+async function enviarEmailTemplate(templateId, params){
+  const diagnostico={
+    momento:new Date().toISOString(),
+    biblioteca:!!window.emailjs,
+    publicKey:!!EMAIL_CONFIG.publicKey,
+    serviceId:EMAIL_CONFIG.serviceId || '',
+    templateId:templateId || '',
+    destino:EMAIL_CONFIG.destinationEmail || '',
+    parametros:Object.keys(params||{})
+  };
+  window.__emailDiagnostico = diagnostico;
+  console.log('[EmailJS DIAGNÓSTICO] início', diagnostico, params);
+  if(!window.emailjs){
+    const erro=new Error('Biblioteca EmailJS não foi carregada no navegador.');
+    diagnostico.erro=erro.message;
+    return {ok:false, configurado:false, error:erro, diagnostico};
+  }
+  if(!EMAIL_CONFIG.publicKey || !EMAIL_CONFIG.serviceId || !templateId){
+    const erro=new Error('Configuração incompleta do EmailJS.');
+    diagnostico.erro=erro.message;
+    return {ok:false, configurado:false, error:erro, diagnostico};
+  }
+  try{
+    emailjs.init({publicKey:EMAIL_CONFIG.publicKey});
+    const r = await emailjs.send(EMAIL_CONFIG.serviceId, templateId, params);
+    diagnostico.resultado='OK';
+    diagnostico.status=r?.status ?? null;
+    diagnostico.text=r?.text ?? null;
+    console.log('[EmailJS DIAGNÓSTICO] sucesso', diagnostico);
+    return {ok:true, response:r, diagnostico};
+  }catch(e){
+    diagnostico.resultado='ERRO';
+    diagnostico.erro=e?.text || e?.message || String(e);
+    diagnostico.status=e?.status ?? null;
+    console.error('[EmailJS DIAGNÓSTICO] falha', diagnostico, e);
+    return {ok:false, configurado:true, error:e, diagnostico};
+  }
+}
+
+async function notificarNovaSolicitacaoEmail(payload, protocolo){
+  const params = {
+    to_email: EMAIL_CONFIG.destinationEmail,
+    destination_email: EMAIL_CONFIG.destinationEmail,
+    protocolo,
+    status: 'Recebida',
+    nome_solicitante: payload.nome_solicitante,
+    email_solicitante: payload.email_solicitante,
+    empresa: payload.empresa,
+    cnpj: payload.cnpj,
+    tipo_documento: payload.tipo_documento,
+    numero_documento: payload.numero_documento,
+    serie: payload.serie,
+    motivo: payload.motivo,
+    razao: payload.motivo,
+    'razão': payload.motivo,
+    motivo_outro: payload.motivo_outro || '',
+    prazo: payload.prazo,
+    justificativa: payload.justificativa,
+    documentos_anexados: 'Sim — documentos armazenados no sistema',
+    aviso_anexos: 'Os documentos anexados estão armazenados no Controle Fiscal.'
+  };
+  return await enviarEmailTemplate(EMAIL_CONFIG.templateNewRequestId, params);
+}
+
+async function notificarAlteracaoStatusEmail(row, novoStatus, observacao){
+  const params = {
+    to_email: EMAIL_CONFIG.destinationEmail,
+    destination_email: EMAIL_CONFIG.destinationEmail,
+    protocolo: row.protocolo,
+    status: novoStatus,
+    status_anterior: row.status || '',
+    nome_solicitante: row.nome_solicitante || '',
+    email_solicitante: row.email_solicitante || '',
+    empresa: row.empresa || '',
+    cnpj: row.cnpj || '',
+    tipo_documento: row.tipo_documento || '',
+    numero_documento: row.numero_documento || '',
+    serie: row.serie || '',
+    motivo: row.motivo || '',
+    prazo: row.prazo || '',
+    observacao: observacao || ''
+  };
+  return await enviarEmailTemplate(EMAIL_CONFIG.templateStatusId, params);
+}
 
 let solicitacoesCache = [];
 async function carregarSolicitacoesCentral(){
@@ -968,18 +1070,31 @@ document.getElementById('form').addEventListener('submit', async function(e){
     motivo:document.getElementById('motivo').value,motivo_outro:document.getElementById('motivoOutro').value.trim()||null,prazo,justificativa:document.getElementById('justificativa').value.trim(),status:'Recebida'
   };
   try{
+    if(btn) btn.textContent='GRAVANDO SOLICITAÇÃO...';
     await supabaseRequest('/rest/v1/solicitacoes',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify(payload)});
     const row={id:solicitacaoId,protocolo};
+    if(btn) btn.textContent='ENVIANDO ANEXOS...';
     const grupos=[['docFiscal','fiscal'],['carta','carta_anuencia'],['docDuplicado','duplicado'],['docSubstituto','substituto']];
     const conhecidos=new Set(grupos.map(x=>x[0]));
     form.querySelectorAll('input[type="file"]').forEach(i=>{if(!conhecidos.has(i.id)&&i.files.length)grupos.push([i.id,'outros']);});
-    for(const [id,categoria] of grupos){const input=document.getElementById(id);if(!input||!input.files.length)continue;for(const file of Array.from(input.files)){if(file.size>8*1024*1024)throw new Error(`O arquivo "${file.name}" excede 8 MB.`);await uploadArquivo(protocolo,file,categoria);}}
+    for(const [id,categoria] of grupos){const input=document.getElementById(id);if(!input||!input.files.length)continue;for(const file of Array.from(input.files)){if(file.size>8*1024*1024)throw new Error(`O arquivo "${file.name}" excede 8 MB.`);await comTimeout(uploadArquivo(protocolo,file,categoria), 30000, `Tempo excedido ao enviar o arquivo \"${file.name}\". Verifique sua conexão e tente novamente.`);}}
+    // E-mail é uma notificação complementar: se o provedor estiver indisponível,
+    // a solicitação continua gravada e não é perdida.
+    console.log('EmailJS parâmetros da nova solicitação:', payload, protocolo);
+    if(btn) btn.textContent='ENVIANDO E-MAIL...';
+    const emailResultado = await comTimeout(notificarNovaSolicitacaoEmail(payload, protocolo), 15000, 'Tempo excedido aguardando o EmailJS. A solicitação foi salva, mas o e-mail não confirmou o envio.');
     document.getElementById('protocol').textContent=protocolo;
     const localidade=tipo==='NFS-e'?`Município: ${municipioSelecionado||''}`:tipo==='CT-e'?`Estado: ${ufSelecionada||''}`:'Não definida';
-    document.getElementById('summary').innerHTML=`<strong>${escapeHtml(tipo)} nº ${escapeHtml(payload.numero_documento)} — Série ${escapeHtml(payload.serie)}</strong><br>${escapeHtml(localidade)}<br>Prazo: ${escapeHtml(prazo)}<br>Motivo: ${escapeHtml(payload.motivo)}<br><span style="color:#126b31"><strong>✓ Solicitação e anexos armazenados na base central.</strong></span>`;
+    const d=emailResultado?.diagnostico || {};
+    const erroEmail=emailResultado?.error ? (emailResultado.error.text || emailResultado.error.message || String(emailResultado.error)) : '';
+    const avisoEmail = emailResultado?.ok
+      ? '<br><span style="color:#126b31"><strong>✓ E-mail de notificação enviado para o setor responsável.</strong></span>'
+      : '<br><span style="color:#9a6700"><strong>⚠ Solicitação salva, mas o e-mail de notificação não foi enviado.</strong></span>'
+        + `<br><small style="display:block;margin-top:8px;color:#6b5a00"><strong>Diagnóstico:</strong> ${escapeHtml(erroEmail || d.erro || 'sem retorno do provedor')}<br>Serviço: ${escapeHtml(d.serviceId||EMAIL_CONFIG.serviceId)}<br>Modelo: ${escapeHtml(d.templateId||EMAIL_CONFIG.templateNewRequestId)}</small>`;
+    document.getElementById('summary').innerHTML=`<strong>${escapeHtml(tipo)} nº ${escapeHtml(payload.numero_documento)} — Série ${escapeHtml(payload.serie)}</strong><br>${escapeHtml(localidade)}<br>Prazo: ${escapeHtml(prazo)}<br>Motivo: ${escapeHtml(payload.motivo)}<br><span style="color:#126b31"><strong>✓ Solicitação e anexos armazenados na base central.</strong></span>${avisoEmail}`;
     form.classList.add('hidden');document.getElementById('success').classList.remove('hidden');
     window.scrollTo({top:0,behavior:'smooth'});
-  }catch(err){console.error(err);alert('Não foi possível concluir a solicitação.\n\n'+err.message);if(btn){btn.disabled=false;btn.textContent='ENVIAR SOLICITAÇÃO';}}
+  }catch(err){console.error(err);alert('Não foi possível concluir a solicitação.\n\n'+err.message+'\n\nA solicitação pode já ter sido gravada no Supabase. Verifique o Controle Fiscal antes de tentar novamente.');if(btn){btn.disabled=false;btn.textContent='ENVIAR SOLICITAÇÃO';}}
 });
 // Controle Fiscal: não carregar automaticamente no modo público.
 // O controle é carregado somente após autenticação fiscal.
@@ -1086,6 +1201,7 @@ document.getElementById('form').addEventListener('submit', async function(e){
         salvar.textContent='SALVANDO...';
         try{
           await atualizarStatusCentral(row.id,novoStatus,observacao);
+          await notificarAlteracaoStatusEmail(row,novoStatus,observacao);
           window.fecharModalStatus();
           await carregarControleCentral();
           alert('Status e histórico atualizados com sucesso.');
